@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 from pathlib import Path
 
 import streamlit as st
@@ -7,15 +9,17 @@ from src.predict import DefaultPredictor
 MODEL_FILENAME = "loanguard_model.joblib"
 
 
-def find_model_path() -> Path:
+def find_model_path() -> Path | None:
     """Search for the model artifact in several sensible locations.
 
-    Order of resolution:
+    Strategy (in order):
     1. LOANGUARD_MODEL_PATH environment variable (explicit override)
-    2. <repo-root>/models/loanguard_model.joblib when running from repo root
-    3. Current working directory ./models/loanguard_model.joblib
-    4. One level up from this file (useful when file is inside project root)
-    5. Two levels up (useful in containerized mounts like /mount/src/<repo>/)
+    2. models/ relative to this file (repo root)
+    3. models/ in the current working directory
+    4. one and two levels up from this file
+    5. scan common mount points (/mount, /mnt, /workspace, /home) for the artifact
+
+    Returns the Path if found, otherwise None.
     """
     # 1) Environment override
     env_path = os.getenv("LOANGUARD_MODEL_PATH")
@@ -24,50 +28,104 @@ def find_model_path() -> Path:
         if p.exists():
             return p
 
-    # Candidate locations
-    candidates = []
-    # a) models/ relative to this file (streamlit_app.py is repo root)
-    candidates.append(Path(__file__).parent.resolve() / "models" / MODEL_FILENAME)
-    # b) models/ in current working directory (supports different invocation contexts)
-    candidates.append(Path.cwd() / "models" / MODEL_FILENAME)
-    # c) one level up from this file
-    candidates.append(Path(__file__).resolve().parents[1] / "models" / MODEL_FILENAME)
-    # d) two levels up (common in container mounts where app is under /mount/src/<repo>/src)
-    candidates.append(Path(__file__).resolve().parents[2] / "models" / MODEL_FILENAME)
+    candidates = [
+        Path(__file__).parent.resolve() / "models" / MODEL_FILENAME,  # repo-root
+        Path.cwd() / "models" / MODEL_FILENAME,  # current working dir
+        Path(__file__).resolve().parents[1] / "models" / MODEL_FILENAME,  # one level up
+        Path(__file__).resolve().parents[2] / "models" / MODEL_FILENAME,  # two levels up
+    ]
 
     for c in candidates:
         if c.exists():
             return c
 
-    # If not found, return the primary candidate (repo-root) for error messaging
-    return candidates[0]
+    # 5) Opportunistic scan of common mount roots (fast break on first found)
+    search_roots = [Path("/mount"), Path("/mnt"), Path("/workspace"), Path("/home")]
+    for root in search_roots:
+        if not root.exists():
+            continue
+        try:
+            # rglob can be expensive; break early on first match
+            for p in root.rglob(MODEL_FILENAME):
+                if p.exists():
+                    return p
+        except PermissionError:
+            # skip locations we can't access
+            continue
+        except Exception:
+            continue
+
+    return None
 
 
 @st.cache_resource
-def load_predictor(model_path: Path):
-    if not model_path.exists():
-        # Provide a helpful message rather than raising an exception so the UI shows guidance
-        st.error(
-            "Production model artifact not found at: {p}\n\n".format(p=model_path)
-            + "Please run `python setup.py` from the repository root to generate the synthetic dataset "
-            + "and train the model, which will create models/loanguard_model.joblib.\n\n"
-            + "Or set the environment variable LOANGUARD_MODEL_PATH to the absolute path of the artifact."
-        )
-        st.stop()
+def load_predictor(model_path: str | Path):
+    """Load and return a DefaultPredictor for the given model path.
+
+    This function is cached by Streamlit so subsequent calls with the same
+    model_path are inexpensive.
+    """
+    model_path = Path(model_path)
+    return DefaultPredictor(model_path)
+
+
+def try_generate_model(setup_path: Path) -> tuple[bool, str]:
+    """Attempt to run the repository bootstrapper (setup.py) to generate the model.
+
+    Returns (success, output).
+    """
+    if not setup_path.exists():
+        return False, f"setup.py not found at {setup_path}"
 
     try:
-        return DefaultPredictor(model_path)
+        # Run setup.py with the current python interpreter
+        res = subprocess.run([sys.executable, str(setup_path)], capture_output=True, text=True, check=False)
+        out = res.stdout + "\n" + res.stderr
+        return (res.returncode == 0, out)
     except Exception as exc:
-        st.error(f"Failed to initialize predictor: {exc}")
-        st.stop()
+        return False, str(exc)
 
 
 def main():
     st.set_page_config(page_title="LoanGuard Underwriting Portal", layout="wide")
-    st.title("LoanGuard - Digital Lending Risk Predictor")
+    st.title("LoanGuard 🛡️ - Digital Lending Risk Predictor")
 
     model_path = find_model_path()
-    predictor = load_predictor(model_path)
+
+    if model_path is None:
+        st.warning(
+            "Production model artifact not found.\n\n"
+            "Please run `python setup.py` from the repository root to generate the synthetic dataset "
+            "and train the model, which will create models/loanguard_model.joblib.\n\n"
+            "Alternatively, set the environment variable LOANGUARD_MODEL_PATH to the absolute path of the artifact."
+        )
+
+        setup_py = Path(__file__).parent / "setup.py"
+        if st.button("Generate model now (runs setup.py)"):
+            with st.spinner("Running setup.py — this can take a minute..."):
+                success, output = try_generate_model(setup_py)
+            if success:
+                st.success("setup.py completed successfully — attempting to load the model now.")
+                # re-resolve model path
+                model_path = find_model_path()
+                if model_path is None:
+                    st.error("Model still not found after running setup.py. See output below.")
+                    st.code(output)
+                    st.stop()
+            else:
+                st.error("Model generation failed. See setup.py output for details.")
+                st.code(output)
+                st.stop()
+        else:
+            st.info("You can either run `python setup.py` in your shell or click the button above to run it here.")
+            st.stop()
+
+    # At this point we should have a model_path
+    try:
+        predictor = load_predictor(str(model_path))
+    except Exception as exc:
+        st.error(f"Failed to initialize predictor from {model_path}: {exc}")
+        st.stop()
 
     with st.sidebar:
         st.header("Model Performance Metrics")
@@ -75,7 +133,6 @@ def main():
         if not metrics:
             st.info("No metrics available in model artifact.")
         for k, v in metrics.items():
-            # Expecting metrics as floats in [0,1]
             try:
                 st.metric(k.replace("_", " ").title(), f"{v:.2%}")
             except Exception:
