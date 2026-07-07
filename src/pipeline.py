@@ -34,38 +34,25 @@ class LoanDataPipeline:
         return out
 
     def load(self, test_size: float = 0.2, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        # Full pipeline: extract -> clean -> transform
-        df = self.extract()
-        cleaned = self.clean(df)
-        transformed = self.transform(cleaned)
-        X = transformed[self.FEATURES]
-        y = transformed["default"]
-        # Use stratified split to preserve class balance
+        prepared = self.transform(self.clean(self.extract()))
+        X = prepared[self.FEATURES]
+        y = prepared["default"]
         return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
 
     @staticmethod
     def generate_sample(path, n: int = 1000, seed: int = 42):
-        """
-        Generates synthetic loan application data and writes to CSV.
-        The logit formula models realistic dependencies:
-         - Lower credit score -> higher default risk
-         - Lower income -> higher default risk
-         - Larger loan amount -> higher default risk
-         - Higher DTI -> higher default risk
-         - Shorter employment length -> higher default risk
-        """
         rng = np.random.default_rng(seed)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        credit_score = rng.integers(300, 851, size=n)  # inclusive upper bound adjust
+        # Generate synthetic features
+        credit_score = rng.integers(300, 851, size=n)
         income = rng.integers(30000, 200001, size=n)
         loan_amt = rng.integers(1000, 50001, size=n)
-        dti = rng.uniform(0.01, 0.9, size=n)
-        emp_length = rng.integers(0, 41, size=n)
+        dti = rng.uniform(0.1, 0.6, size=n)
+        emp_length = rng.integers(0, 21, size=n)
 
-        # Custom logistic formulation for default probability
-        # Coefficients tuned to produce a reasonable default rate distribution
+        # Logit formulation for default probability
         logit = (
             5.0
             - 0.015 * credit_score
@@ -74,17 +61,16 @@ class LoanDataPipeline:
             + 4.0 * dti
             - 0.1 * emp_length
         )
-        prob = 1.0 / (1.0 + np.exp(-logit))
-        defaults = (rng.random(n) < prob).astype(int)
+        prob = 1 / (1 + np.exp(-logit))
+        default = (rng.random(n) < prob).astype(int)
 
         df = pd.DataFrame({
-            "applicant_id": [f"APP{i:06d}" for i in range(n)],
+            "applicant_id": [f"APP{i:05d}" for i in range(n)],
             "credit_score": credit_score,
             "annual_income": income,
             "loan_amount": loan_amt,
             "dti_ratio": np.round(dti, 2),
             "emp_length": emp_length,
-            "default": defaults
+            "default": default,
         })
-
         df.to_csv(path, index=False)
